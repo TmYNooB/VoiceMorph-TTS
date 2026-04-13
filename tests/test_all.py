@@ -129,13 +129,13 @@ def test_engine():
     sr = AudioEngine._detect_sr(None, None)
     _check("_detect_sr ergibt gültige SR", sr in (96000, 88200, 48000, 44100, 32000, 22050, 16000), f"sr={sr}")
 
-    # _calc_chunk: ~85ms Blöcke pro SR
+    # _calc_chunk: ~40ms Blöcke pro SR
     chunk_16k = AudioEngine._calc_chunk(16000)
     chunk_48k = AudioEngine._calc_chunk(48000)
     chunk_96k = AudioEngine._calc_chunk(96000)
     _check("_calc_chunk(16000) ≥ 512",  chunk_16k >= 512,  f"chunk={chunk_16k}")
-    _check("_calc_chunk(48000) = 4096", chunk_48k == 4096, f"chunk={chunk_48k}")
-    _check("_calc_chunk(96000) = 8192", chunk_96k == 8192, f"chunk={chunk_96k}")
+    _check("_calc_chunk(48000) = 2048", chunk_48k == 2048, f"chunk={chunk_48k}")
+    _check("_calc_chunk(96000) = 4096", chunk_96k == 4096, f"chunk={chunk_96k}")
 
 
 # ─── 3. Presets laden ─────────────────────────────────────────────────────────

@@ -226,8 +226,8 @@ class AudioEngine:
 
     @staticmethod
     def _calc_chunk(sr: int) -> int:
-        """Berechnet CHUNK_SIZE für ~85 ms Blockgröße, auf Zweierpotenz gerundet."""
-        raw = sr * 0.085
+        """Berechnet CHUNK_SIZE für ~40 ms Blockgröße, auf Zweierpotenz gerundet."""
+        raw = sr * 0.04
         return max(512, 2 ** math.ceil(math.log2(max(raw, 512))))
 
     @staticmethod
@@ -299,12 +299,34 @@ class AudioEngine:
         status,
     ) -> None:
         """
-        RT-Callback: NUR Queue-Operationen, keine schwere Python-Verarbeitung.
+        RT-Callback: so wenig Python wie möglich.
 
-        put_nowait / get_nowait sind C-Funktionen → minimale GIL-Zeit.
-        Kein pedalboard-, kein scipy-Aufruf in diesem Thread.
+        Bypass-Modus (kein Preset): indata direkt nach outdata – keine Queue,
+        keine Latenz, kein Dropout-Risiko.
+        Effekt-Modus: Queue-Operationen (put_nowait / get_nowait = C-Calls).
         """
-        # ── Mikrofon → raw_queue ─────────────────────────────────────────────
+        # Preset-Status thread-safe lesen (minimaler Lock)
+        with self._lock:
+            has_effects = bool(self._params) and self._board is not None
+
+        # ── BYPASS: direktes Passthrough – null Latenz, null Dropout ─────────
+        if not has_effects:
+            raw = indata[:frames, 0] if indata.ndim > 1 else indata[:frames]
+            n = min(len(raw), frames)
+            if outdata.ndim > 1:
+                for ch in range(outdata.shape[1]):
+                    outdata[:n, ch] = raw[:n]
+                    if n < frames:
+                        outdata[n:, ch] = 0.0
+            else:
+                outdata[:n] = raw[:n]
+                if n < frames:
+                    outdata[n:] = 0.0
+            self.current_rms = float(compute_rms(raw))
+            return
+
+        # ── EFFEKT-MODUS: Queue-Operationen ──────────────────────────────────
+        # Mikrofon → raw_queue
         if not self._stopping:
             raw = indata[:frames, 0].copy() if indata.ndim > 1 else indata[:frames].copy()
             try:
@@ -312,7 +334,7 @@ class AudioEngine:
             except queue.Full:
                 pass  # Verwerfen wenn Worker nicht mitkommt
 
-        # ── out_queue → Lautsprecher ─────────────────────────────────────────
+        # out_queue → Lautsprecher
         try:
             block = self._out_queue.get_nowait()
         except queue.Empty:
@@ -325,11 +347,10 @@ class AudioEngine:
             raise sd.CallbackStop
 
         if block is None:
-            # Kurze Stille – kein Block-Repeat (wiederholte Blöcke klingen wie Stotter).
             outdata.fill(0)
             return
 
-        # Audio in outdata schreiben
+        # Audio schreiben
         n = min(len(block), frames)
         if outdata.ndim > 1:
             for ch in range(outdata.shape[1]):
@@ -341,8 +362,6 @@ class AudioEngine:
             if n < frames:
                 outdata[n:] = 0.0
 
-        # RMS in einfaches float schreiben – kein emit(), kein Signal, kein Mutex.
-        # UI liest per QTimer (polling). Dadurch kein GIL-Blocking im RT-Thread.
         self.current_rms = float(compute_rms(block))
 
     def _on_stream_finished(self) -> None:
