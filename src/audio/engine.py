@@ -1,23 +1,22 @@
 """
 Live Audio Engine – Echtzeit-Mikrofon-zu-Ausgabe Pipeline.
 
-Queue-Architektur mit drainiertem Stop:
-  Mic → RT-Callback (raw_queue.put) → Worker-Thread (process_audio)
-      → out_queue.put → RT-Callback (out_queue.get) → Lautsprecher
+Direkter Callback-Ansatz (kein Worker-Thread, keine Queues):
+  Mic → _callback → process_audio (pedalboard) → Lautsprecher
 
-Warum Queue besser als direkter Callback:
-  ✓ RT-Callback macht nur Queue-Ops (<0.1 ms) – kein GIL-bedingtes Stottern
-  ✓ PyQt-Ereignisse können den GIL beliebig lang halten; betrifft RT-Thread nicht
-  ✓ Drain-on-Stop: Worker verarbeitet alle verbliebenen Blöcke → kein Satzende-Cutoff
-  ✓ Eigener _SENTINEL statt None → kein vorzeitiger Stop bei kurz leerer Queue
-  ✓ stop() → _running=False sofort (UI reagiert) – Drain läuft still im Hintergrund
-  ✓ SR-Erkennung ab 96kHz abwärts → beste verfügbare Qualität
-  ✓ Dynamische CHUNK_SIZE (~85ms) passt sich an jede SR an
+Warum direkt besser als Queue+Worker:
+  ✓ Kein OS-Scheduling-Jitter: Queue-Worker kann für >40ms eingefroren werden
+    → out_queue leer → Dropout. Direkter Callback hat dieses Problem nicht.
+  ✓ Pedalboard gibt GIL frei während C++-Verarbeitung (~11ms)
+    → Qt-Hauptthread kann in dieser Zeit Events verarbeiten (31ms Spielraum).
+  ✓ RMS wird direkt in current_rms geschrieben (float), kein emit()
+    → kein GIL-Blocking durch Qt-Synchronisation.
+  ✓ Keine Pipeline-Latenz, kein Drain-on-Stop nötig.
+  ✓ 50ms Hardware-Puffer (latency=0.05) als Sicherheitsnetz.
 """
 
 import math
 import threading
-import queue
 import numpy as np
 from typing import Optional, Callable, List, Tuple
 
@@ -30,14 +29,9 @@ except (ImportError, OSError):
 from audio.effects import build_pedalboard, process_audio, compute_rms
 
 
-# Kein fester CHUNK_SIZE mehr – wird zur Laufzeit aus der SR berechnet (_calc_chunk)
 SAMPLE_RATE = 48000   # Fallback; wird bei Start auf native Geräte-SR gesetzt
 CHANNELS    = 1       # Mono
 DTYPE       = np.float32
-QUEUE_SIZE  = 3       # ~255 ms Puffer (3 × 85 ms Blöcke) – genug für Worker-Spikes
-
-# Eigener Sentinel-Typ – von None unterscheidbar (wichtig für Drain-Logik)
-_SENTINEL = object()
 
 
 class AudioEngine:
@@ -45,22 +39,19 @@ class AudioEngine:
     Verwaltet den Live-Audio-Stream (Mikrofon → Verarbeitung → Lautsprecher).
 
     Callbacks:
-        on_rms_update(float)  – wird pro Block aufgerufen mit RMS-Wert (0–1)
-        on_error(str)         – bei Fehler im Stream
+        on_error(str) – bei Fehler beim Stream-Start
     """
 
     def __init__(
         self,
-        on_rms_update: Optional[Callable[[float], None]] = None,
+        on_rms_update: Optional[Callable[[float], None]] = None,  # Legacy, ungenutzt
         on_error:      Optional[Callable[[str], None]] = None,
     ):
-        self._on_rms_update = on_rms_update   # Legacy – wird nicht mehr vom RT-Thread gerufen!
-        self._on_error      = on_error
+        self._on_error   = on_error
 
-        self._stream:   Optional[object] = None
-        self._running:  bool             = False
-        self._stopping: bool             = False
-        self._lock:     threading.Lock   = threading.Lock()
+        self._stream:    Optional[object] = None
+        self._running:   bool             = False
+        self._lock:      threading.Lock   = threading.Lock()
 
         self._params:    dict             = {}
         self._board                       = None
@@ -69,13 +60,10 @@ class AudioEngine:
         self.input_device:  Optional[int] = None
         self.output_device: Optional[int] = None
 
-        self._raw_queue: queue.Queue = queue.Queue(maxsize=QUEUE_SIZE)
-        self._out_queue: queue.Queue = queue.Queue(maxsize=QUEUE_SIZE)
-        self._worker_thread: Optional[threading.Thread] = None
         self._chunk_size: int = AudioEngine._calc_chunk(SAMPLE_RATE)
 
-        # RT-sicherer RMS-Wert: vom Callback geschrieben, per QTimer gelesen.
-        # Kein emit() aus dem RT-Thread → kein GIL-Blocking.
+        # RMS-Wert: vom RT-Callback geschrieben (nur float-Assign, GIL-safe).
+        # UI liest per QTimer (polling) – kein emit(), kein Qt-Kontakt im RT-Thread.
         self.current_rms: float = 0.0
 
     # ── Public API ───────────────────────────────────────────────────────────
@@ -97,8 +85,8 @@ class AudioEngine:
                 )
             return False
 
-        # Laufenden/drainierenden Stream sauber abbrechen
-        self._abort_stream()
+        if self._running:
+            return True
 
         sr = self._detect_sr(self.input_device, self.output_device)
         self._active_sr  = sr
@@ -108,45 +96,23 @@ class AudioEngine:
             if self._params:
                 self._board = build_pedalboard(self._params, sr)
 
-        # Zustand zurücksetzen
-        self._stopping = False
-        self._running  = False
-
-        # Queues leeren
-        for q in (self._raw_queue, self._out_queue):
-            while True:
-                try:
-                    q.get_nowait()
-                except queue.Empty:
-                    break
-
-        # Worker-Thread starten
-        self._worker_thread = threading.Thread(
-            target=self._worker_loop,
-            daemon=True,
-            name="AudioWorker",
-        )
-        self._worker_thread.start()
-
         try:
             self._stream = sd.Stream(
-                samplerate        = sr,
-                blocksize         = self._chunk_size,
-                channels          = CHANNELS,
-                dtype             = DTYPE,
-                device            = (self.input_device, self.output_device),
-                callback          = self._callback,
-                finished_callback = self._on_stream_finished,
-                # 50 ms reichen jetzt aus: RT-Callback macht nur Queue-Ops (<0.1 ms)
-                # → kein GIL-Blocking möglich. GIL-Holdup kommt nur noch aus dem
-                # Worker-Thread (pedalboard), der NICHT im RT-Thread läuft.
-                latency           = 0.05,
+                samplerate = sr,
+                blocksize  = self._chunk_size,
+                channels   = CHANNELS,
+                dtype      = DTYPE,
+                device     = (self.input_device, self.output_device),
+                callback   = self._callback,
+                # 50ms Hardware-Puffer reicht aus:
+                # Callback hält GIL nur für ~11ms (pedalboard C++ gibt ihn frei).
+                # Qt hat ~30ms pro Block-Intervall zum Event-Processing.
+                latency    = 0.05,
             )
             self._stream.start()
             self._running = True
             return True
         except Exception as exc:
-            self._stopping = False
             if self._on_error:
                 self._on_error(
                     f"Mikrofon konnte nicht geöffnet werden:\n{exc}\n\n"
@@ -156,19 +122,16 @@ class AudioEngine:
             return False
 
     def stop(self) -> None:
-        """
-        Stoppt den Live-Stream mit sauberem Drain.
-
-        _running = False sofort (UI kann sofort reagieren).
-        Stream drainiert im Hintergrund und stoppt via sd.CallbackStop
-        nachdem der letzte echte Audio-Block gespielt wurde.
-        """
-        if not self._running:
-            return
-        self._running  = False
-        self._stopping = True
-        # Worker erkennt _stopping per 50ms-Timeout → sendet None-Sentinel
-        # → Callback hebt sd.CallbackStop → _on_stream_finished bereinigt
+        """Stoppt den Live-Stream."""
+        self._running = False
+        if self._stream is not None:
+            try:
+                self._stream.stop()
+                self._stream.close()
+            except Exception:
+                pass
+            self._stream = None
+        self.current_rms = 0.0
 
     @property
     def is_running(self) -> bool:
@@ -202,31 +165,11 @@ class AudioEngine:
             pass
         return devices
 
-    # ── Interne Methoden ─────────────────────────────────────────────────────
-
-    def _abort_stream(self) -> None:
-        """Bricht laufenden/drainierenden Stream sofort ab (kein Drain)."""
-        old_stream = self._stream
-        self._stream = None  # Verhindert Doppelbereinigung in _on_stream_finished
-        if old_stream is not None:
-            try:
-                old_stream.abort()
-                old_stream.close()
-            except Exception:
-                pass
-        # Worker stoppen falls noch aktiv
-        if self._worker_thread and self._worker_thread.is_alive():
-            self._stopping = True
-            try:
-                self._raw_queue.put_nowait(None)  # Explicit sentinel
-            except queue.Full:
-                pass
-            self._worker_thread.join(timeout=0.3)
-        self._stopping = False
+    # ── Interne Hilfsmethoden ─────────────────────────────────────────────────
 
     @staticmethod
     def _calc_chunk(sr: int) -> int:
-        """Berechnet CHUNK_SIZE für ~40 ms Blockgröße, auf Zweierpotenz gerundet."""
+        """~40ms Blockgröße, auf Zweierpotenz gerundet."""
         raw = sr * 0.04
         return max(512, 2 ** math.ceil(math.log2(max(raw, 512))))
 
@@ -244,51 +187,14 @@ class AudioEngine:
                 continue
         return SAMPLE_RATE
 
-    def _worker_loop(self) -> None:
-        """
-        Verarbeitungs-Thread: raw_queue → process_audio → out_queue.
-
-        Stoppt sauber wenn _stopping=True und raw_queue leer ist:
-        Schreibt None-Sentinel in out_queue → Callback hebt sd.CallbackStop →
-        PortAudio spielt verbleibende Hardware-Buffer aus → sauberes Ende.
-        """
-        while True:
-            try:
-                raw = self._raw_queue.get(timeout=0.03)  # 30 ms – schnelles Drain-Fenster
-            except queue.Empty:
-                if self._stopping:
-                    # Kein Input mehr → Sentinel senden → Stream stoppt sauber
-                    try:
-                        self._out_queue.put(_SENTINEL, timeout=1.0)
-                    except queue.Full:
-                        pass
-                    break
-                continue
-
-            if raw is None:  # Expliziter Sentinel (aus _abort_stream)
-                try:
-                    self._out_queue.put(_SENTINEL, timeout=1.0)
-                except queue.Full:
-                    pass
-                break
-
-            # Preset-Parameter thread-safe lesen
-            with self._lock:
-                params = dict(self._params)
-                board  = self._board
-
-            try:
-                processed = (
-                    process_audio(raw, self._active_sr, params, board)
-                    if params else raw.copy()
-                )
-            except Exception:
-                processed = raw.copy()
-
-            try:
-                self._out_queue.put(processed, timeout=0.2)
-            except queue.Full:
-                pass  # Block verwerfen wenn Ausgabe-Queue voll
+    # ── RT-Callback ──────────────────────────────────────────────────────────
+    #
+    # Läuft im PortAudio-RT-Thread.
+    #
+    # Bypass (kein Preset): indata → outdata direkt. Kein Python-Overhead.
+    # Effekt-Modus: process_audio() → pedalboard gibt GIL für ~11ms frei
+    #   → Qt-Thread kann Events in dieser Zeit verarbeiten.
+    #   Kein OS-Scheduling-Jitter (kein Worker-Thread mehr).
 
     def _callback(
         self,
@@ -298,85 +204,58 @@ class AudioEngine:
         time_info,
         status,
     ) -> None:
-        """
-        RT-Callback: so wenig Python wie möglich.
+        raw = indata[:frames, 0] if indata.ndim > 1 else indata[:frames]
 
-        Bypass-Modus (kein Preset): indata direkt nach outdata – keine Queue,
-        keine Latenz, kein Dropout-Risiko.
-        Effekt-Modus: Queue-Operationen (put_nowait / get_nowait = C-Calls).
-        """
-        # Preset-Status thread-safe lesen (minimaler Lock)
+        # Preset-Status thread-safe lesen
         with self._lock:
-            has_effects = bool(self._params) and self._board is not None
+            params = dict(self._params)
+            board  = self._board
 
-        # ── BYPASS: direktes Passthrough – null Latenz, null Dropout ─────────
-        if not has_effects:
-            raw = indata[:frames, 0] if indata.ndim > 1 else indata[:frames]
-            n = min(len(raw), frames)
-            if outdata.ndim > 1:
-                for ch in range(outdata.shape[1]):
-                    outdata[:n, ch] = raw[:n]
-                    if n < frames:
-                        outdata[n:, ch] = 0.0
-            else:
-                outdata[:n] = raw[:n]
-                if n < frames:
-                    outdata[n:] = 0.0
-            self.current_rms = float(compute_rms(raw))
-            return
-
-        # ── EFFEKT-MODUS: Queue-Operationen ──────────────────────────────────
-        # Mikrofon → raw_queue
-        if not self._stopping:
-            raw = indata[:frames, 0].copy() if indata.ndim > 1 else indata[:frames].copy()
+        if params and board is not None:
             try:
-                self._raw_queue.put_nowait(raw)
-            except queue.Full:
-                pass  # Verwerfen wenn Worker nicht mitkommt
+                processed = process_audio(raw, self._active_sr, params, board)
+            except Exception:
+                processed = raw
+        else:
+            processed = raw  # Bypass: kein Preset → direkte Kopie
 
-        # out_queue → Lautsprecher
-        try:
-            block = self._out_queue.get_nowait()
-        except queue.Empty:
-            block = None
-
-        # _SENTINEL → Worker fertig, Drain abgeschlossen → stoppen.
-        # None → Queue kurz leer (Startup/Spike) → Stille, NICHT stoppen.
-        if block is _SENTINEL:
-            outdata.fill(0)
-            raise sd.CallbackStop
-
-        if block is None:
-            outdata.fill(0)
-            return
-
-        # Audio schreiben
-        n = min(len(block), frames)
+        n = min(len(processed), frames)
         if outdata.ndim > 1:
             for ch in range(outdata.shape[1]):
-                outdata[:n, ch] = block[:n]
+                outdata[:n, ch] = processed[:n]
                 if n < frames:
                     outdata[n:, ch] = 0.0
         else:
-            outdata[:n] = block[:n]
+            outdata[:n] = processed[:n]
             if n < frames:
                 outdata[n:] = 0.0
 
-        self.current_rms = float(compute_rms(block))
+        # RMS-Update: float-Assign ist GIL-sicher, kein emit() nötig.
+        self.current_rms = float(compute_rms(processed))
 
-    def _on_stream_finished(self) -> None:
-        """
-        Wird von PortAudio aufgerufen nachdem Stream vollständig gestoppt hat.
-        Bereinigt Stream-Objekt in einem separaten Thread (sicher vor PortAudio re-entrancy).
-        """
-        self._stopping = False
-        stream = self._stream
-        self._stream = None
-        if stream is not None:
-            def _close():
-                try:
-                    stream.close()
-                except Exception:
-                    pass
-            threading.Thread(target=_close, daemon=True).start()
+
+import math
+import threading
+import queue
+import numpy as np
+from typing import Optional, Callable, List, Tuple
+
+try:
+    import sounddevice as sd
+    SOUNDDEVICE_AVAILABLE = True
+except (ImportError, OSError):
+    SOUNDDEVICE_AVAILABLE = False
+
+from audio.effects import build_pedalboard, process_audio, compute_rms
+
+
+# Kein fester CHUNK_SIZE mehr – wird zur Laufzeit aus der SR berechnet (_calc_chunk)
+SAMPLE_RATE = 48000   # Fallback; wird bei Start auf native Geräte-SR gesetzt
+CHANNELS    = 1       # Mono
+DTYPE       = np.float32
+QUEUE_SIZE  = 3       # ~255 ms Puffer (3 × 85 ms Blöcke) – genug für Worker-Spikes
+
+# Eigener Sentinel-Typ – von None unterscheidbar (wichtig für Drain-Logik)
+_SENTINEL = object()
+
 

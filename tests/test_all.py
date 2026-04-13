@@ -102,13 +102,13 @@ def test_engine():
     _hline("Audio Engine")
     from audio.engine import AudioEngine
 
-    # Queue-Architektur (Worker-Thread + Queues)
+    # Direkter Callback – kein Worker-Thread, keine Queues
     engine = AudioEngine()
-    _check("AudioEngine hat _raw_queue",        hasattr(engine, "_raw_queue"))
-    _check("AudioEngine hat _out_queue",         hasattr(engine, "_out_queue"))
-    _check("AudioEngine hat _worker_loop",       hasattr(engine, "_worker_loop"))
-    _check("AudioEngine hat _callback",          hasattr(engine, "_callback"))
-    _check("is_running initial = False",         not engine.is_running)
+    _check("AudioEngine hat _callback",       hasattr(engine, "_callback"))
+    _check("AudioEngine hat current_rms",     hasattr(engine, "current_rms"))
+    _check("Keine Queue-Attribute",           not hasattr(engine, "_raw_queue"))
+    _check("Kein Worker-Thread",              not hasattr(engine, "_worker_thread"))
+    _check("is_running initial = False",      not engine.is_running)
 
     # Preset setzen ohne laufenden Stream
     bypass = {"pitch_semitones": 0.0, "reverb_room_size": 0.0,
